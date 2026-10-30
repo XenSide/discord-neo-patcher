@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const zlib = require('zlib');
+const { execFileSync } = require('child_process');
 
 // Stream Deck doesn't persist stdout for this plugin, so also keep a small log next to the code.
 const LOG_FILE = path.join(__dirname, 'plugin.log');
@@ -188,15 +189,15 @@ async function rankChannels(c, guildId, currentId) {
 	const voice = (channels || []).filter((ch) => ch.type === VOICE);
 	const full = await Promise.all(voice.map((ch) => c.request('GET_CHANNEL', { channel_id: ch.id }).catch(() => null)));
 	return full.filter(Boolean)
-		.map((ch) => ({ id: ch.id, name: ch.name, count: (ch.voice_states || []).length - (ch.id === currentId ? 1 : 0) }))
+		.map((ch) => ({ id: ch.id, name: ch.name, states: ch.voice_states || [], count: (ch.voice_states || []).length - (ch.id === currentId ? 1 : 0) }))
 		.sort((a, b) => b.count - a.count);
 }
 
 async function joinBusiest(settings) {
 	const c = await discord();
 	const current = await c.request('GET_SELECTED_VOICE_CHANNEL').catch(() => null);
-	const guildId = settings.guildId || (current && current.guild_id);
-	if (!guildId) throw new Error('No server selected and not in a voice channel');
+	const guildId = settings.guildId || (current && current.guild_id) || globalSettings.lastGuildId;
+	if (!guildId) throw new Error('Pick a server in the key settings, or join a call once');
 	const currentId = current && current.guild_id === guildId ? current.id : null;
 	const ranked = await rankChannels(c, guildId, currentId);
 	const here = ranked.find((ch) => ch.id === currentId);
@@ -238,15 +239,13 @@ const ART = {
 	mutedByThem: asset('badges/mutedByThem.svg'),
 };
 
-function memberFromState(vs) {
-	if (!vs || !vs.user) return;
+function toMember(vs, prev) {
 	const u = vs.user;
 	const s = vs.voice_state || {};
 	const url = u.avatar
 		? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=128`
 		: `https://cdn.discordapp.com/embed/avatars/${(Number(BigInt(u.id) >> 22n) % 6)}.png`;
-	const prev = members.get(u.id);
-	members.set(u.id, {
+	return {
 		name: vs.nick || u.global_name || u.username || '',
 		avatarUrl: url,
 		lastSpoke: prev ? prev.lastSpoke : 0,
@@ -254,7 +253,12 @@ function memberFromState(vs) {
 		mutedByUs: !!vs.mute,
 		mutedByThem: !!(s.mute || s.self_mute),
 		deafened: !!(s.deaf || s.self_deaf),
-	});
+	};
+}
+
+function memberFromState(vs) {
+	if (!vs || !vs.user) return;
+	members.set(vs.user.id, toMember(vs, members.get(vs.user.id)));
 }
 
 /* Stream Deck's renderer ignores clip-path, so the exe cuts avatars round in the pixels
@@ -306,8 +310,13 @@ function pngToRgba(buf) {
 }
 
 function rgbaToPng({ w, h, px }) {
-	const raw = Buffer.alloc((w * 4 + 1) * h);
-	for (let y = 0; y < h; y++) px.copy(raw, y * (w * 4 + 1) + 1, y * w * 4, (y + 1) * w * 4);
+	// "Sub" row filter + fast deflate: ~0.5 ms for a key image, about the size resvg's own encoder gives.
+	const stride = w * 4, raw = Buffer.alloc((stride + 1) * h);
+	for (let y = 0; y < h; y++) {
+		const o = y * (stride + 1), r = y * stride;
+		raw[o] = 1;
+		for (let x = 0; x < stride; x++) raw[o + 1 + x] = px[r + x] - (x >= 4 ? px[r + x - 4] : 0);
+	}
 	const chunk = (kind, d) => {
 		const b = Buffer.alloc(12 + d.length);
 		b.writeUInt32BE(d.length, 0); b.write(kind, 4, 'ascii'); d.copy(b, 8);
@@ -317,7 +326,7 @@ function rgbaToPng({ w, h, px }) {
 	const ihdr = Buffer.alloc(13);
 	ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 6;
 	return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-		chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+		chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw, { level: 1 })), chunk('IEND', Buffer.alloc(0))]);
 }
 
 function roundPng(buf) {
@@ -351,21 +360,29 @@ function orderedMembers() {
 
 const num = (n) => String(Math.round(n * 1000) / 1000);
 
-// One user in a 144x144 box: round avatar, speaking ring, mute/deafen badges.
-function userSvg(m, uri, id) {
-	let s = `<clipPath id="${id}"><circle cx="72" cy="72" r="72"/></clipPath>`;
-	s += uri
-		? `<image x="0" y="0" width="144" height="144" preserveAspectRatio="none" clip-path="url(#${id})" xlink:href="${uri}"/>`
-		: '<circle cx="72" cy="72" r="72" style="fill:#4e5058"/>';
+// One user in slot i of an n-avatar layout, as layers bottom to top: round avatar, speaking ring,
+// mute/deafen badges. Each layer is [cache key, () => svg markup, x, y].
+function userLayers(m, uri, n, i) {
+	// Drawn once per size (and sub-pixel offset), then placed at the slot's whole-pixel position,
+	// so someone moving to another slot as the speaking order changes reuses the same pixels.
+	const L = LAYOUT[n], dx = Math.floor(L.x[i]), dy = Math.floor(L.y), fx = num(L.x[i] - dx), fy = num(L.y - dy);
+	const slot = `${n} ${fx} ${fy}`;
+	const at = (s) => () => `<g transform="translate(${fx} ${fy}) scale(${L.s} ${L.s})">${s()}</g>`;
+	const layer = (key, s) => [key, at(s), dx, dy];
+	const layers = [layer(`avatar ${slot} ${uri ? m.avatarUrl : '-'}`, () => uri
+		? `<clipPath id="u${i}"><circle cx="72" cy="72" r="72"/></clipPath>`
+			+ `<image x="0" y="0" width="144" height="144" preserveAspectRatio="none" clip-path="url(#u${i})" xlink:href="${uri}"/>`
+		: '<circle cx="72" cy="72" r="72" style="fill:#4e5058"/>')];
 	if (m.speaking) {
-		s += '<circle cx="72" cy="72" r="64" style="fill:none;stroke-width:8;stroke:#111111;stroke-opacity:1"/>';
-		s += '<circle cx="72" cy="72" r="68" style="fill:none;stroke-width:8;stroke:#24a459;stroke-opacity:1"/>';
+		layers.push(layer(`ring ${slot}`, () => '<circle cx="72" cy="72" r="64" style="fill:none;stroke-width:8;stroke:#111111;stroke-opacity:1"/>'
+			+ '<circle cx="72" cy="72" r="68" style="fill:none;stroke-width:8;stroke:#24a459;stroke-opacity:1"/>'));
 	}
-	if (m.deafened) s += `<g transform="translate(106 106) scale(1.2 1.2)">${ART.deafened}</g>`;
+	if (m.deafened) layers.push(layer(`deafened ${slot}`, () => `<g transform="translate(106 106) scale(1.2 1.2)">${ART.deafened}</g>`));
 	if (m.mutedByUs || m.mutedByThem) {
-		s += `<g transform="translate(${m.deafened ? 64 : 106} 106) scale(1.2 1.2)">${m.mutedByUs ? ART.mutedByUs : ART.mutedByThem}</g>`;
+		const x = m.deafened ? 64 : 106, art = m.mutedByUs ? 'mutedByUs' : 'mutedByThem';
+		layers.push(layer(`${art} ${slot} ${x}`, () => `<g transform="translate(${x} 106) scale(1.2 1.2)">${ART[art]}</g>`));
 	}
-	return `<g>${s}</g>`;
+	return layers;
 }
 
 // Gray count pill, icon on the left, pinned 13px from the top-right corner.
@@ -374,7 +391,7 @@ function pillSvg(n, icon) {
 	return `<g transform="translate(${num(144 - w - 13)} 13)"><g>`
 		+ `<rect x="0" y="0" width="${w}" height="32" rx="16" style="fill:#4d4f5b;fill-opacity:1;stroke:none"/>`
 		// No textLength (the exe sets w - 35): renderers that honour it stretch "12" into "1 2".
-		+ `<text x="36" y="24" style="font-size:24px;font-weight:bold;line-height:1;font-family:sans-serif;text-anchor:start;text-align:center;fill:#FFFFFF;fill-opacity:1;stroke:none">${n}</text>`
+		+ `<text x="36" y="24" style="font-size:24px;font-weight:bold;line-height:1;font-family:${fontName()};text-anchor:start;text-align:center;fill:#FFFFFF;fill-opacity:1;stroke:none">${n}</text>`
 		+ `</g><g transform="translate(4 0)">${icon}</g></g>`;
 }
 
@@ -395,18 +412,110 @@ const LAYOUT = {
 	3: { s: 0.5, x: [0, 36, 72], y: 36 },
 };
 
-async function buildVoiceKey() {
-	const shown = orderedMembers().slice(0, 3);
+// The key's own glyph (neo/key.svg), drawn on Elgato's tile when there is nobody to show.
+const GLYPH = '<g style="fill:#FFFFFF" transform="translate(30 30) scale(3.5 3.5)">'
+	+ '<circle cx="5.6" cy="9" r="2.3"/><path d="M1 18.1c0-2.55 1.95-4.6 4.6-4.6.9 0 1.72.26 2.42.72-1.12 1.13-1.82 2.64-1.82 4.32v.46H1z"/>'
+	+ '<circle cx="18.4" cy="9" r="2.3"/><path d="M23 18.1c0-2.55-1.95-4.6-4.6-4.6-.9 0-1.72.26-2.42.72 1.12 1.13 1.82 2.64 1.82 4.32v.46H23z"/>'
+	+ '<circle cx="12" cy="7.2" r="3.1"/><path d="M5.1 19c0-3.72 3.03-6.3 6.9-6.3s6.9 2.58 6.9 6.3v.5H5.1z"/></g>';
+
+// list: members to draw (first is on top); total: count for the pill; joined: false dims the key
+// like the exe does for a channel you're not in (black at 50% over everything).
+async function buildVoiceKey(list, total, joined) {
+	const shown = list.slice(0, 3);
 	const uris = await Promise.all(shown.map((m) => avatar(m.avatarUrl)));
-	const L = LAYOUT[shown.length];
-	let body = ART.background;
-	for (let i = shown.length - 1; i >= 0; i--) {
-		body += `<g transform="translate(${L.x[i]} ${L.y}) scale(${L.s} ${L.s})">${userSvg(shown[i], uris[i], 'u' + i)}</g>`;
+	const layers = [['background', () => ART.background]];
+	if (shown.length) {
+		for (let i = shown.length - 1; i >= 0; i--) layers.push(...userLayers(shown[i], uris[i], shown.length, i));
+		layers.push([`pill ${total}`, () => pillSvg(total, ART.usersTalking)]);
+	} else {
+		layers.push(['glyph', () => GLYPH]);
 	}
-	body += pillSvg(members.size, ART.usersTalking);
-	if (quality >= 0 && quality <= 1) body += barsSvg(quality); // only warn on a bad (red) connection
-	const svg = `<svg width="144px" height="144px" viewBox="0 0 144 144" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
-	return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
+	if (joined && quality >= 0 && quality <= 1) layers.push([`bars ${quality}`, () => barsSvg(quality)]); // only warn on a bad (red) connection
+	if (!joined && shown.length) layers.push(['dim', () => '<rect x="0" y="0" width="144" height="144" style="fill:#000000;fill-opacity:.5;stroke:none"/>']);
+	return composite(layers);
+}
+
+/* Key images go out as PNGs: Stream Deck rasterizing an SVG with embedded avatars holds back the
+   deck's next key event (180-615 ms measured on the Volume Controller fork). Each layer is drawn by
+   resvg once and cached as pixels, so a redraw (someone starts or stops talking) only stacks cached
+   layers and encodes the PNG: ~0.5 ms instead of ~4 ms for a full resvg render. */
+let Resvg = null;
+try { ({ Resvg } = require('@resvg/resvg-js')); } catch (e) { log('resvg unavailable, sending SVG:', e.message); }
+const fontName = () => (host && host.font) || 'Segoe UI';
+let fontFiles = null;
+
+// Font files of one family, from the Windows font registry (machine and per-user installs).
+function fontFilesFor(family) {
+	if (fontFiles) return fontFiles;
+	const files = [];
+	for (const hive of ['HKLM', 'HKCU']) {
+		let out = '';
+		try {
+			out = execFileSync('reg', ['query', hive + '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts'],
+				{ encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+		} catch {}
+		for (const line of out.split(/\r?\n/)) {
+			const m = /^\s+(.+?)\s+REG_SZ\s+(.+?)\s*$/.exec(line);
+			const name = m ? m[1].replace(/\s*\((TrueType|OpenType)\)$/i, '') : '';
+			// "Segoe UI Bold" is the family, "Segoe UI Emoji" is another family that only shares the prefix.
+			if (name.toLowerCase().startsWith(family.toLowerCase())
+				&& /^(\s+(bold|italic|light|semibold|semilight|black|regular|thin|medium|oblique))*$/i.test(name.slice(family.length))) {
+				files.push(path.isAbsolute(m[2]) ? m[2] : path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', m[2]));
+			}
+		}
+	}
+	return (fontFiles = files.filter((f) => fs.existsSync(f)));
+}
+
+const svgDoc = (body) => `<svg width="144px" height="144px" viewBox="0 0 144 144" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
+const layerCache = new Map(); // key -> { x, y, w, h, px }: premultiplied RGBA cropped to the pixels it covers
+
+function layerPixels(key, markup) {
+	let l = layerCache.get(key);
+	if (l) { layerCache.delete(key); layerCache.set(key, l); return l; } // keep recently used ones last
+	const svg = svgDoc(markup());
+	// Loading fonts costs ~1.5 ms, so only layers with text (the pill) get them.
+	const files = svg.includes('<text') ? fontFilesFor(fontName()) : null;
+	const font = !files ? { loadSystemFonts: false } : files.length ? { loadSystemFonts: false, fontFiles: files, defaultFontFamily: fontName() } : { loadSystemFonts: true };
+	const full = new Resvg(svg, { font }).render().pixels;
+	let x0 = 144, y0 = 144, x1 = -1, y1 = -1;
+	for (let p = 0; p < 144 * 144; p++) {
+		if (!full[p * 4 + 3]) continue;
+		const x = p % 144, y = (p / 144) | 0;
+		if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+	}
+	const w = Math.max(0, x1 - x0 + 1), h = Math.max(0, y1 - y0 + 1), px = Buffer.alloc(w * h * 4);
+	for (let r = 0; r < h; r++) full.copy(px, r * w * 4, ((y0 + r) * 144 + x0) * 4, ((y0 + r) * 144 + x0 + w) * 4);
+	l = { x: x0, y: y0, w, h, px };
+	layerCache.set(key, l);
+	if (layerCache.size > 150) layerCache.delete(layerCache.keys().next().value); // under 9 MB even if all were avatars
+	return l;
+}
+
+function composite(layers) {
+	if (Resvg) {
+		try {
+			const out = Buffer.alloc(144 * 144 * 4);
+			for (const [key, markup, dx = 0, dy = 0] of layers) {
+				const l = layerPixels(key, markup), { w, h, px } = l, x = l.x + dx, y = l.y + dy;
+				// A slot's box can reach past the key's edge; clip so it doesn't wrap into the next row.
+				for (let r = 0; r < Math.min(h, 144 - y); r++) {
+					for (let c = 0, s = r * w * 4, d = ((y + r) * 144 + x) * 4; c < Math.min(w, 144 - x); c++, s += 4, d += 4) {
+						const a = px[s + 3];
+						if (!a) continue;
+						const k = 255 - a; // premultiplied "over"
+						for (let j = 0; j < 4; j++) out[d + j] = px[s + j] + ((out[d + j] * k + 127) / 255 | 0);
+					}
+				}
+			}
+			for (let d = 0; d < out.length; d += 4) { // PNG wants straight alpha
+				const a = out[d + 3];
+				if (a && a < 255) for (let j = 0; j < 3; j++) out[d + j] = Math.min(255, Math.round(out[d + j] * 255 / a));
+			}
+			return 'data:image/png;base64,' + rgbaToPng({ w: 144, h: 144, px: out }).toString('base64');
+		} catch (e) { log('PNG render failed, sending SVG:', e.message); }
+	}
+	return 'data:image/svg+xml;base64,' + Buffer.from(svgDoc(layers.map(([, markup, dx = 0, dy = 0]) => `<g transform="translate(${dx} ${dy})">${markup()}</g>`).join(''))).toString('base64');
 }
 
 let renderTimer = null;
@@ -417,9 +526,41 @@ function renderLive() {
 
 async function renderNow() {
 	if (contexts.size === 0) return;
-	if (members.size === 0) { for (const ctx of contexts.keys()) { setImage(ctx, ''); setTitle(ctx, ''); } return; }
-	const img = await buildVoiceKey();
-	for (const ctx of contexts.keys()) { setImage(ctx, img); setTitle(ctx, ''); }
+	if (liveChannelId && members.size) {
+		const img = await buildVoiceKey(orderedMembers(), members.size, true);
+		for (const ctx of contexts.keys()) setImage(ctx, img);
+		return;
+	}
+	// Not in a call: each key previews the busiest channel of its server, dimmed.
+	const images = new Map();
+	for (const [ctx, settings] of contexts) {
+		const guild = guildFor(settings);
+		const p = preview.get(guild);
+		const id = p ? guild : '';
+		if (!images.has(id)) images.set(id, await (p ? buildVoiceKey(p.list, p.total, false) : buildVoiceKey([], 0, true)));
+		setImage(ctx, images.get(id));
+	}
+}
+
+/* ------------------------------------------- Busiest-channel preview */
+// RPC has no server-wide voice event (subscriptions are per channel), so while you're not in a
+// call the busiest channel is polled with the same ranking the key press uses.
+const preview = new Map();       // guildId -> { list, total } of its busiest channel, or null if all empty
+const guildFor = (settings) => settings.guildId || globalSettings.lastGuildId || '';
+let previewBusy = false;
+
+async function refreshPreview() {
+	if (previewBusy || liveChannelId || !isCurrent(ipc) || contexts.size === 0) return;
+	previewBusy = true;
+	try {
+		for (const guild of new Set([...contexts.values()].map(guildFor).filter(Boolean))) {
+			const ranked = await rankChannels(ipc, guild, null).catch(() => null);
+			if (!ranked) continue;
+			const top = ranked[0];
+			preview.set(guild, top && top.count > 0 ? { list: top.states.filter((vs) => vs.user).map((vs) => toMember(vs)), total: top.count } : null);
+		}
+	} finally { previewBusy = false; }
+	renderLive();
 }
 
 async function liveSetupChannel(c, channelId) {
@@ -432,8 +573,10 @@ async function liveSetupChannel(c, channelId) {
 	members.clear(); speakSeq = 0;
 	if (!channelId) quality = -1;
 	renderLive();
-	if (!channelId) return;
+	if (!channelId) { refreshPreview(); return; }
 	const ch = await c.request('GET_CHANNEL', { channel_id: channelId }).catch(() => null);
+	// Remember the server of your last call: the preview and the key press fall back to it.
+	if (ch && ch.guild_id && ch.guild_id !== globalSettings.lastGuildId) saveGlobalSettings({ ...globalSettings, lastGuildId: ch.guild_id });
 	for (const vs of (ch && ch.voice_states) || []) memberFromState(vs);
 	renderLive();
 	for (const e of ev) sub(e, { channel_id: channelId });
@@ -473,17 +616,22 @@ function ensureLive() {
 /* ------------------------------------------------------------- Stream Deck */
 // Runs inside launcher.js, which owns the Stream Deck socket and routes our actions here.
 const ACTIONS = new Set(['com.xenside.discordneo.busiest']);
-let host = null; // { send, saveGlobal }
+let host = null; // { send, saveGlobal, font }
 let globalSettings = {};
 const contexts = new Map(); // context -> settings
 
 function sdSend(o) { try { host.send(o); } catch (e) { log('sdSend', e.message); } }
 const setTitle = (ctx, title) => sdSend({ event: 'setTitle', context: ctx, payload: { title: String(title), target: 0 } });
-const setImage = (ctx, image) => sdSend({ event: 'setImage', context: ctx, payload: { image: image || '', target: 0 } });
+// Stream Deck rasterizes every image it is sent, so only send one when the picture changed.
+const shownImage = new Map(); // context -> last image sent
+const setImage = (ctx, image) => {
+	if (shownImage.get(ctx) === (image || '')) return;
+	shownImage.set(ctx, image || '');
+	sdSend({ event: 'setImage', context: ctx, payload: { image: image || '', target: 0 } });
+};
 const showAlert = (ctx) => sdSend({ event: 'showAlert', context: ctx });
-const showOk = (ctx) => sdSend({ event: 'showOk', context: ctx });
 const toPI = (ctx, action, payload) => sdSend({ event: 'sendToPropertyInspector', context: ctx, action, payload });
-const shortName = (s) => { s = String(s || ''); return s.length > 10 ? s.slice(0, 9) + '…' : s; };
+const flashTitle = (ctx, title) => { setTitle(ctx, title); setTimeout(() => setTitle(ctx, ''), 3000); };
 
 function saveGlobalSettings(gs) {
 	globalSettings = gs;
@@ -493,18 +641,15 @@ function saveGlobalSettings(gs) {
 let lastError = '';
 async function press(ctx) {
 	try {
+		// Joining needs no confirmation: the key switches to the live view of the new call by itself.
 		const res = await joinBusiest(contexts.get(ctx) || {});
 		lastError = '';
-		if (!res) { setTitle(ctx, 'empty'); showAlert(ctx); return; }
-		const ch = res.joined || res.stayed;
-		setTitle(ctx, shortName(ch.name) + '\n' + (ch.count + 1));
-		showOk(ctx);
+		if (!res) flashTitle(ctx, 'Empty');
 	} catch (e) {
 		lastError = e.message;
 		log('press', e.message);
 		showAlert(ctx);
 	}
-	setTimeout(() => renderLive(), 4000); // hand the key back to the live speaker view
 }
 
 async function onPIMessage(ctx, action, msg) {
@@ -538,13 +683,17 @@ function onEvent(ev) {
 			break;
 		case 'willAppear':
 			contexts.set(context, settings);
+			shownImage.delete(context); // a reappearing key has lost its image
 			renderLive();
+			refreshPreview();
 			break;
 		case 'didReceiveSettings':
 			contexts.set(context, settings);
+			refreshPreview(); // the server may have changed
 			break;
 		case 'willDisappear':
 			contexts.delete(context);
+			shownImage.delete(context);
 			break;
 		case 'keyDown':
 			press(context);
@@ -560,6 +709,7 @@ function onEvent(ev) {
 function init(h) {
 	host = h;
 	setInterval(ensureLive, 15000); // reconnect the live view if Discord/IPC drops
+	setInterval(refreshPreview, 20000);
 }
 
 module.exports = { ACTIONS, init, onEvent, log };

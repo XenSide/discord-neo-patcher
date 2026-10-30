@@ -119,5 +119,7 @@ busiest.init({
 	send: sendSd,
 	pluginUUID: args.uuid,
 	saveGlobal: (gs) => { ownGlobal = gs; pushGlobal(); },
+	// Stream Deck's UI font, which the official keys use for their text.
+	font: (() => { try { return JSON.parse(args.info).application.font || ''; } catch { return ''; } })(),
 });
 sdConnect();
