@@ -1,0 +1,27 @@
+{
+	"Name": "Discord Busiest",
+	"Version": "1.0.0",
+	"Author": "xenside",
+	"Description": "Join the voice channel with the most people in your Discord server. Shows who's in your call.",
+	"Category": "Discord",
+	"CategoryIcon": "images/category",
+	"Icon": "ui/icon",
+	"URL": "https://github.com/XenSide/discord-neo-patcher",
+	"SDKVersion": 2,
+	"CodePath": "bin/plugin.js",
+	"Nodejs": { "Version": "20" },
+	"Software": { "MinimumVersion": "6.5" },
+	"OS": [{ "Platform": "windows", "MinimumVersion": "10" }],
+	"UUID": "com.xenside.discordbusiest",
+	"Actions": [
+		{
+			"UUID": "com.xenside.discordbusiest.join",
+			"Name": "Join Busiest Channel",
+			"Tooltip": "Join the voice channel with the most people in it; tap again to leave. Shows who's in your channel.",
+			"Icon": "ui/icon",
+			"Controllers": ["Keypad"],
+			"PropertyInspectorPath": "ui/busiest.html",
+			"States": [{ "Image": "ui/key" }]
+		}
+	]
+}

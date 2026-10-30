@@ -2,7 +2,7 @@
 	"Name": "Discord NEO",
 	"Version": "2.4.0.123",
 	"Author": "xenside",
-	"Description": "Elgato's Discord plugin, unmodified, plus a Join Busiest Channel / live speaker key.",
+	"Description": "Elgato's Discord plugin, with its in-call Voice Channel key sent to Stream Deck as small PNGs.",
 	"Category": "Discord",
 	"CategoryIcon": "images/category",
 	"Icon": "images/plugin",
@@ -161,15 +161,6 @@
 			"Icon": "images/icons/toggleScreenShare",
 			"Controllers": ["Keypad"],
 			"States": [{ "Image": "images/actions/stream_0", "Name": "Enable Stream" }, { "Image": "images/actions/stream_1", "Name": "Disable Stream" }]
-		},
-		{
-			"UUID": "com.xenside.discordneo.busiest",
-			"Name": "Join Busiest Channel",
-			"Tooltip": "Join the voice channel with the most people in it. Shows who's in your channel.",
-			"Icon": "neo/icon",
-			"Controllers": ["Keypad"],
-			"PropertyInspectorPath": "neo/busiest.html",
-			"States": [{ "Image": "neo/key" }]
 		}
 	]
 }

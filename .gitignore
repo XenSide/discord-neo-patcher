@@ -1,5 +1,5 @@
 dist/
 backup-*/
 node_modules/
-template/bin/app.json
+busiest/bin/app.json
 *.log

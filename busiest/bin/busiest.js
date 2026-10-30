@@ -1,6 +1,6 @@
 'use strict';
 /*
- * Discord NEO - "busiest channel" + live speaker action (Node, CommonJS), driven by launcher.js.
+ * Discord Busiest - "busiest channel" + live speaker action (Node, CommonJS), driven by plugin.js.
  *
  * On key press it connects to the local Discord client over its IPC pipe,
  * counts the voice_states of every voice channel in the chosen server and
@@ -13,8 +13,8 @@
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
-const zlib = require('zlib');
-const { execFileSync } = require('child_process');
+const render = require('./render');
+const { avatar, composite } = render;
 
 // Stream Deck doesn't persist stdout for this plugin, so also keep a small log next to the code.
 const LOG_FILE = path.join(__dirname, 'plugin.log');
@@ -183,27 +183,34 @@ async function connectAndAuth() {
 }
 
 /* ---------------------------------------------------------------- Busiest */
-// Ranks voice channels by people in them, not counting yourself in your current channel.
-async function rankChannels(c, guildId, currentId) {
+// The server's voice channels that have people in them, busiest first: { id, name, list (members), total }.
+async function rankChannels(c, guildId) {
 	const { channels } = await c.request('GET_CHANNELS', { guild_id: guildId });
 	const voice = (channels || []).filter((ch) => ch.type === VOICE);
 	const full = await Promise.all(voice.map((ch) => c.request('GET_CHANNEL', { channel_id: ch.id }).catch(() => null)));
-	return full.filter(Boolean)
-		.map((ch) => ({ id: ch.id, name: ch.name, states: ch.voice_states || [], count: (ch.voice_states || []).length - (ch.id === currentId ? 1 : 0) }))
-		.sort((a, b) => b.count - a.count);
+	return full.filter((ch) => ch && (ch.voice_states || []).length)
+		.map((ch) => ({ id: ch.id, name: ch.name, list: ch.voice_states.filter((vs) => vs.user).map((vs) => toMember(vs)), total: ch.voice_states.length }))
+		.sort((a, b) => b.total - a.total);
 }
 
-async function joinBusiest(settings) {
+async function joinFor(ctx) {
 	const c = await discord();
 	const current = await c.request('GET_SELECTED_VOICE_CHANNEL').catch(() => null);
-	const guildId = settings.guildId || (current && current.guild_id) || globalSettings.lastGuildId;
+	const inCall = !!(current && current.id), i = slotOf(ctx), guildId = guildFor(contexts.get(ctx).settings);
+	// The first key, and any key sharing your call with it, hangs up (channel_id null leaves voice).
+	if (inCall && (i === 0 || spanOf(ctx))) {
+		await c.request('SELECT_VOICE_CHANNEL', { channel_id: null }, 10000);
+		return { left: current };
+	}
 	if (!guildId) throw new Error('Pick a server in the key settings, or join a call once');
-	const currentId = current && current.guild_id === guildId ? current.id : null;
-	const ranked = await rankChannels(c, guildId, currentId);
-	const here = ranked.find((ch) => ch.id === currentId);
-	const candidates = ranked.filter((ch) => ch.id !== currentId && ch.count > 0 && (!here || ch.count > here.count));
-	if (!candidates.length) return here ? { stayed: here } : null;
-	// The busiest channel can be full or locked; fall back to the next ones.
+	// Ranked fresh: the keys' picture can be 20 s old, and a channel that emptied since mustn't be joined.
+	const ranked = await rankChannels(c, guildId);
+	preview.set(guildId, ranked);
+	renderLive();
+	const others = ranked.filter((ch) => !inCall || ch.id !== current.id);
+	const candidates = others.slice(inCall ? i - 1 : i);
+	if (!candidates.length) return null;
+	// It can be full or locked; fall back to the less busy ones after it.
 	for (const ch of candidates) {
 		try {
 			await c.request('SELECT_VOICE_CHANNEL', { channel_id: ch.id, force: true }, 10000);
@@ -222,9 +229,8 @@ let liveChannelId = null;
 let speakSeq = 0;                // monotonic "last spoke" order
 let quality = -1;                // connection bars 0..3, -1 hides them
 const members = new Map();       // user_id -> { name, avatarUrl, lastSpoke, speaking, mutedByUs, mutedByThem, deafened }
-const avatarCache = new Map();   // url -> dataURI (or null while fetching)
 
-// Elgato's own artwork, read from the official plugin files this plugin is built from.
+// Elgato's own artwork, copied from your official Discord plugin by install-busiest.js.
 const IMAGES = path.join(__dirname, '..', 'images');
 // Stream Deck's renderer drops nested <svg> elements, so keep only each file's inner markup.
 const asset = (f) => {
@@ -259,98 +265,6 @@ function toMember(vs, prev) {
 function memberFromState(vs) {
 	if (!vs || !vs.user) return;
 	members.set(vs.user.id, toMember(vs, members.get(vs.user.id)));
-}
-
-/* Stream Deck's renderer ignores clip-path, so the exe cuts avatars round in the pixels
-   (FUN_14005b750) before embedding them. Same here: minimal PNG decode -> alpha circle -> encode. */
-const CRC_TABLE = Int32Array.from({ length: 256 }, (_, n) => {
-	let c = n;
-	for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-	return c;
-});
-const crc32 = (buf) => { let c = -1; for (const b of buf) c = CRC_TABLE[(c ^ b) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; };
-
-// 8-bit, non-interlaced PNG -> RGBA pixels; null for anything else (caller keeps the original).
-function pngToRgba(buf) {
-	if (buf.length < 8 || buf.readUInt32BE(0) !== 0x89504e47) return null;
-	let w, h, type, depth, interlace, pal, trns;
-	const idat = [];
-	for (let o = 8; o + 8 <= buf.length;) {
-		const len = buf.readUInt32BE(o), kind = buf.toString('ascii', o + 4, o + 8), d = buf.subarray(o + 8, o + 8 + len);
-		if (kind === 'IHDR') { w = d.readUInt32BE(0); h = d.readUInt32BE(4); depth = d[8]; type = d[9]; interlace = d[12]; }
-		else if (kind === 'PLTE') pal = d;
-		else if (kind === 'tRNS') trns = d;
-		else if (kind === 'IDAT') idat.push(d);
-		o += 12 + len;
-	}
-	const ch = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[type];
-	if (depth !== 8 || interlace || !ch || (type === 3 && !pal)) return null;
-	const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * ch, px = Buffer.alloc(stride * h);
-	for (let y = 0; y < h; y++) {
-		const f = raw[y * (stride + 1)], src = y * (stride + 1) + 1, row = y * stride, up = row - stride;
-		for (let x = 0; x < stride; x++) {
-			const a = x >= ch ? px[row + x - ch] : 0, b = y ? px[up + x] : 0, c = x >= ch && y ? px[up + x - ch] : 0;
-			let v = raw[src + x];
-			if (f === 1) v += a;
-			else if (f === 2) v += b;
-			else if (f === 3) v += (a + b) >> 1;
-			else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
-			px[row + x] = v & 255;
-		}
-	}
-	const out = Buffer.alloc(w * h * 4);
-	for (let i = 0; i < w * h; i++) {
-		const s = i * ch, o = i * 4;
-		if (type === 6) px.copy(out, o, s, s + 4);
-		else if (type === 2) { out[o] = px[s]; out[o + 1] = px[s + 1]; out[o + 2] = px[s + 2]; out[o + 3] = 255; }
-		else if (type === 3) { const k = px[s]; out[o] = pal[k * 3]; out[o + 1] = pal[k * 3 + 1]; out[o + 2] = pal[k * 3 + 2]; out[o + 3] = trns && k < trns.length ? trns[k] : 255; }
-		else { out[o] = out[o + 1] = out[o + 2] = px[s]; out[o + 3] = type === 4 ? px[s + 1] : 255; }
-	}
-	return { w, h, px: out };
-}
-
-function rgbaToPng({ w, h, px }) {
-	// "Sub" row filter + fast deflate: ~0.5 ms for a key image, about the size resvg's own encoder gives.
-	const stride = w * 4, raw = Buffer.alloc((stride + 1) * h);
-	for (let y = 0; y < h; y++) {
-		const o = y * (stride + 1), r = y * stride;
-		raw[o] = 1;
-		for (let x = 0; x < stride; x++) raw[o + 1 + x] = px[r + x] - (x >= 4 ? px[r + x - 4] : 0);
-	}
-	const chunk = (kind, d) => {
-		const b = Buffer.alloc(12 + d.length);
-		b.writeUInt32BE(d.length, 0); b.write(kind, 4, 'ascii'); d.copy(b, 8);
-		b.writeUInt32BE(crc32(b.subarray(4, 8 + d.length)), 8 + d.length);
-		return b;
-	};
-	const ihdr = Buffer.alloc(13);
-	ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 6;
-	return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-		chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw, { level: 1 })), chunk('IEND', Buffer.alloc(0))]);
-}
-
-function roundPng(buf) {
-	const img = pngToRgba(buf);
-	if (!img) return buf;
-	const { w, h, px } = img, r = Math.min(w, h) / 2;
-	for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-		const k = Math.max(0, Math.min(1, r - Math.hypot(x + 0.5 - w / 2, y + 0.5 - h / 2) + 0.5)); // anti-aliased edge
-		const i = (y * w + x) * 4 + 3;
-		px[i] = Math.round(px[i] * k);
-	}
-	return rgbaToPng(img);
-}
-
-async function avatar(url) {
-	if (avatarCache.has(url)) return avatarCache.get(url);
-	avatarCache.set(url, null);
-	try {
-		const r = await fetch(url);
-		const b = roundPng(Buffer.from(await r.arrayBuffer()));
-		const uri = 'data:image/png;base64,' + b.toString('base64');
-		avatarCache.set(url, uri);
-		return uri;
-	} catch { avatarCache.delete(url); return null; }
 }
 
 function orderedMembers() {
@@ -391,7 +305,7 @@ function pillSvg(n, icon) {
 	return `<g transform="translate(${num(144 - w - 13)} 13)"><g>`
 		+ `<rect x="0" y="0" width="${w}" height="32" rx="16" style="fill:#4d4f5b;fill-opacity:1;stroke:none"/>`
 		// No textLength (the exe sets w - 35): renderers that honour it stretch "12" into "1 2".
-		+ `<text x="36" y="24" style="font-size:24px;font-weight:bold;line-height:1;font-family:${fontName()};text-anchor:start;text-align:center;fill:#FFFFFF;fill-opacity:1;stroke:none">${n}</text>`
+		+ `<text x="36" y="24" style="font-size:24px;font-weight:bold;line-height:1;font-family:${render.fontName()};text-anchor:start;text-align:center;fill:#FFFFFF;fill-opacity:1;stroke:none">${n}</text>`
 		+ `</g><g transform="translate(4 0)">${icon}</g></g>`;
 }
 
@@ -412,151 +326,28 @@ const LAYOUT = {
 	3: { s: 0.5, x: [0, 36, 72], y: 36 },
 };
 
-// The key's own glyph (neo/key.svg), drawn on Elgato's tile when there is nobody to show.
+// The key's own glyph (ui/key.svg), drawn on Elgato's tile when there is nobody to show.
 const GLYPH = '<g style="fill:#FFFFFF" transform="translate(30 30) scale(3.5 3.5)">'
 	+ '<circle cx="5.6" cy="9" r="2.3"/><path d="M1 18.1c0-2.55 1.95-4.6 4.6-4.6.9 0 1.72.26 2.42.72-1.12 1.13-1.82 2.64-1.82 4.32v.46H1z"/>'
 	+ '<circle cx="18.4" cy="9" r="2.3"/><path d="M23 18.1c0-2.55-1.95-4.6-4.6-4.6-.9 0-1.72.26-2.42.72 1.12 1.13 1.82 2.64 1.82 4.32v.46H23z"/>'
 	+ '<circle cx="12" cy="7.2" r="3.1"/><path d="M5.1 19c0-3.72 3.03-6.3 6.9-6.3s6.9 2.58 6.9 6.3v.5H5.1z"/></g>';
 
 // list: members to draw (first is on top); total: count for the pill; joined: false dims the key
-// like the exe does for a channel you're not in (black at 50% over everything).
-async function buildVoiceKey(list, total, joined) {
+// like the exe does for a channel you're not in (black at 50% over everything); first: false for
+// the 2nd/3rd key of a joined row, which leave the count and connection warning to the first.
+async function buildVoiceKey(list, total, joined, first = true) {
 	const shown = list.slice(0, 3);
 	const uris = await Promise.all(shown.map((m) => avatar(m.avatarUrl)));
 	const layers = [['background', () => ART.background]];
 	if (shown.length) {
 		for (let i = shown.length - 1; i >= 0; i--) layers.push(...userLayers(shown[i], uris[i], shown.length, i));
-		layers.push([`pill ${total}`, () => pillSvg(total, ART.usersTalking)]);
+		if (first) layers.push([`pill ${total}`, () => pillSvg(total, ART.usersTalking)]);
 	} else {
 		layers.push(['glyph', () => GLYPH]);
 	}
-	if (joined && quality >= 0 && quality <= 1) layers.push([`bars ${quality}`, () => barsSvg(quality)]); // only warn on a bad (red) connection
+	if (joined && first && quality >= 0 && quality <= 1) layers.push([`bars ${quality}`, () => barsSvg(quality)]); // only warn on a bad (red) connection
 	if (!joined && shown.length) layers.push(['dim', () => '<rect x="0" y="0" width="144" height="144" style="fill:#000000;fill-opacity:.5;stroke:none"/>']);
 	return composite(layers);
-}
-
-/* Key images go out as PNGs: Stream Deck rasterizing an SVG with embedded avatars holds back the
-   deck's next key event (180-615 ms measured on the Volume Controller fork). Each layer is drawn by
-   resvg once and cached as pixels, so a redraw (someone starts or stops talking) only stacks cached
-   layers and encodes the PNG: ~0.5 ms instead of ~4 ms for a full resvg render. */
-let Resvg = null;
-try { ({ Resvg } = require('@resvg/resvg-js')); } catch (e) { log('resvg unavailable, sending SVG:', e.message); }
-const fontName = () => (host && host.font) || 'Segoe UI';
-let fontFiles = null;
-
-// Font files of one family, from the Windows font registry (machine and per-user installs).
-function fontFilesFor(family) {
-	if (fontFiles) return fontFiles;
-	const files = [];
-	for (const hive of ['HKLM', 'HKCU']) {
-		let out = '';
-		try {
-			out = execFileSync('reg', ['query', hive + '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts'],
-				{ encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-		} catch {}
-		for (const line of out.split(/\r?\n/)) {
-			const m = /^\s+(.+?)\s+REG_SZ\s+(.+?)\s*$/.exec(line);
-			const name = m ? m[1].replace(/\s*\((TrueType|OpenType)\)$/i, '') : '';
-			// "Segoe UI Bold" is the family, "Segoe UI Emoji" is another family that only shares the prefix.
-			if (name.toLowerCase().startsWith(family.toLowerCase())
-				&& /^(\s+(bold|italic|light|semibold|semilight|black|regular|thin|medium|oblique))*$/i.test(name.slice(family.length))) {
-				files.push(path.isAbsolute(m[2]) ? m[2] : path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', m[2]));
-			}
-		}
-	}
-	return (fontFiles = files.filter((f) => fs.existsSync(f)));
-}
-
-const SVG_OPEN = '<svg width="144px" height="144px" viewBox="0 0 144 144" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">';
-const svgDoc = (body, root = SVG_OPEN) => root + body + '</svg>';
-const layerCache = new Map(); // key -> { x, y, w, h, px }: premultiplied RGBA cropped to the pixels it covers
-
-// Loading fonts costs ~1.5 ms, so only SVGs with text get them.
-function fontOptions(svg) {
-	if (!svg.includes('<text')) return { loadSystemFonts: false };
-	const files = fontFilesFor(fontName());
-	return files.length ? { loadSystemFonts: false, fontFiles: files, defaultFontFamily: fontName() } : { loadSystemFonts: true };
-}
-
-// Top-level elements of an SVG document: { root: '<svg ...>', kids: [...] }, or null if it doesn't close.
-function splitSvg(svg) {
-	const open = /<svg\b[^>]*>/.exec(svg);
-	if (!open) return null;
-	const kids = [], tag = /<(\/?)([A-Za-z][\w:.-]*)[^>]*?(\/?)>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g;
-	let depth = 0, start = 0;
-	tag.lastIndex = open.index + open[0].length;
-	for (let m; (m = tag.exec(svg));) {
-		if (!m[2]) continue; // comment or CDATA
-		if (m[1]) {
-			if (!depth) return m[2] === 'svg' ? { root: open[0], kids } : null;
-			if (!--depth) kids.push(svg.slice(start, tag.lastIndex));
-		} else if (m[3]) {
-			if (!depth) kids.push(m[0]);
-		} else if (!depth++) start = m.index;
-	}
-	return null;
-}
-
-/* The official exe's SVGs (launcher.js), drawn like our own key: each top-level element is a cached
-   layer, so a speaking change only redraws the user group that changed. Definitions go into every
-   layer. Returns a PNG data URI, or null to send the SVG unchanged. */
-function exeImage(svg) {
-	if (!Resvg) return null;
-	const parts = splitSvg(svg);
-	const root = parts ? parts.root : '';
-	// Layers are drawn on our 144x144 canvas, so anything else (or unsplittable) is rendered whole.
-	if (!parts || !/\bwidth=["']144(px)?["']/.test(root) || !/\bheight=["']144(px)?["']/.test(root)
-		|| (/viewBox/.test(root) && !/viewBox=["']0[ ,]+0[ ,]+144[ ,]+144["']/.test(root))) {
-		return 'data:image/png;base64,' + new Resvg(svg, { font: fontOptions(svg) }).render().asPng().toString('base64');
-	}
-	const isDef = (k) => /^<(defs|clipPath|mask|linearGradient|radialGradient|pattern|filter|symbol|style)\b/.test(k);
-	const defs = parts.kids.filter(isDef).join('');
-	return composite(parts.kids.filter((k) => !isDef(k)).map((k) => [defs + k, () => defs + k, 0, 0, parts.root]));
-}
-
-function layerPixels(key, markup, root) {
-	let l = layerCache.get(key);
-	if (l) { layerCache.delete(key); layerCache.set(key, l); return l; } // keep recently used ones last
-	const svg = svgDoc(markup(), root);
-	const full = new Resvg(svg, { font: fontOptions(svg) }).render().pixels;
-	let x0 = 144, y0 = 144, x1 = -1, y1 = -1;
-	for (let p = 0; p < 144 * 144; p++) {
-		if (!full[p * 4 + 3]) continue;
-		const x = p % 144, y = (p / 144) | 0;
-		if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-	}
-	const w = Math.max(0, x1 - x0 + 1), h = Math.max(0, y1 - y0 + 1), px = Buffer.alloc(w * h * 4);
-	for (let r = 0; r < h; r++) full.copy(px, r * w * 4, ((y0 + r) * 144 + x0) * 4, ((y0 + r) * 144 + x0 + w) * 4);
-	l = { x: x0, y: y0, w, h, px };
-	layerCache.set(key, l);
-	if (layerCache.size > 150) layerCache.delete(layerCache.keys().next().value); // under 9 MB even if all were avatars
-	return l;
-}
-
-function composite(layers) {
-	if (Resvg) {
-		try {
-			const out = Buffer.alloc(144 * 144 * 4);
-			for (const [key, markup, dx = 0, dy = 0, root] of layers) {
-				const l = layerPixels(key, markup, root), { w, h, px } = l, x = l.x + dx, y = l.y + dy;
-				// A slot's box can reach past the key's edge; clip so it doesn't wrap into the next row.
-				for (let r = 0; r < Math.min(h, 144 - y); r++) {
-					for (let c = 0, s = r * w * 4, d = ((y + r) * 144 + x) * 4; c < Math.min(w, 144 - x); c++, s += 4, d += 4) {
-						const a = px[s + 3];
-						if (!a) continue;
-						const k = 255 - a; // premultiplied "over"
-						for (let j = 0; j < 4; j++) out[d + j] = px[s + j] + ((out[d + j] * k + 127) / 255 | 0);
-					}
-				}
-			}
-			for (let d = 0; d < out.length; d += 4) { // PNG wants straight alpha
-				const a = out[d + 3];
-				if (a && a < 255) for (let j = 0; j < 3; j++) out[d + j] = Math.min(255, Math.round(out[d + j] * 255 / a));
-			}
-			return 'data:image/png;base64,' + rgbaToPng({ w: 144, h: 144, px: out }).toString('base64');
-		} catch (e) { log('PNG render failed, sending SVG:', e.message); }
-	}
-	return 'data:image/svg+xml;base64,' + Buffer.from(svgDoc(layers.map(([, markup, dx = 0, dy = 0]) => `<g transform="translate(${dx} ${dy})">${markup()}</g>`).join(''), layers[0] && layers[0][4])).toString('base64');
 }
 
 let renderTimer = null;
@@ -566,41 +357,89 @@ function renderLive() {
 }
 
 async function renderNow() {
-	if (contexts.size === 0) return;
-	if (liveChannelId && members.size) {
-		const img = await buildVoiceKey(orderedMembers(), members.size, true);
-		for (const ctx of contexts.keys()) setImage(ctx, img);
-		return;
-	}
-	// Not in a call: each key previews the busiest channel of its server, dimmed.
-	const images = new Map();
-	for (const [ctx, settings] of contexts) {
-		const guild = guildFor(settings);
-		const p = preview.get(guild);
-		const id = p ? guild : '';
-		if (!images.has(id)) images.set(id, await (p ? buildVoiceKey(p.list, p.total, false) : buildVoiceKey([], 0, true)));
+	const images = new Map(); // one picture per distinct view
+	for (const ctx of contexts.keys()) {
+		const v = viewOf(ctx);
+		const id = v === 'live' ? (members.size ? 'live' : '') : v && v.tile !== undefined ? 'live ' + v.tile + '/' + v.tiles : v ? v.id : '';
+		if (!images.has(id)) {
+			images.set(id, await (id === 'live' ? buildVoiceKey(orderedMembers(), members.size, true)
+				: v && v.tile !== undefined ? buildVoiceKey(tileMembers(v.tile, v.tiles), members.size, true, v.tile === 0)
+					: id ? buildVoiceKey(v.list, v.total, false) // a channel you're not in, dimmed
+						: buildVoiceKey([], 0, true)));
+		}
 		setImage(ctx, images.get(id));
 	}
 }
 
-/* ------------------------------------------- Busiest-channel preview */
-// RPC has no server-wide voice event (subscriptions are per channel), so while you're not in a
-// call the busiest channel is polled with the same ranking the key press uses.
-const preview = new Map();       // guildId -> { list, total } of its busiest channel, or null if all empty
-const guildFor = (settings) => settings.guildId || globalSettings.lastGuildId || '';
-let previewBusy = false;
+/* -------------------------------------------------- ranked keys */
+// Keys for the same server on the same deck rank in reading order. Not in a call, they show the
+// busiest, 2nd, 3rd... busiest channel. In a call, the first shows your call live (and leaves on
+// tap) and the others the busiest channels you're not in. A single key is just the first one.
+function slotOf(ctx) {
+	const k = contexts.get(ctx), guild = guildFor(k.settings);
+	return [...contexts].filter(([, o]) => o.device === k.device && guildFor(o.settings) === guild)
+		.sort(([, a], [, b]) => a.row - b.row || a.col - b.col)
+		.findIndex(([c]) => c === ctx);
+}
 
+// 'live' (your call), { tile, tiles } (part of your call spread over a row), a ranked channel,
+// or null when there is nothing to show at this rank.
+function viewOf(ctx) {
+	const span = spanOf(ctx);
+	if (span) return span;
+	const i = slotOf(ctx), ranked = preview.get(guildFor(contexts.get(ctx).settings)) || [];
+	if (!liveChannelId) return ranked[i] || null;
+	if (i === 0) return 'live';
+	return ranked.filter((ch) => ch.id !== liveChannelId)[i - 1] || null;
+}
+
+// In a call with nobody in the server's other channels, the first key and up to two keys right
+// after it in the same row have nothing else to show, so they share your call: { tile, tiles }.
+// One key per person at most, so no key of the row is left empty.
+function spanOf(ctx) {
+	if (!liveChannelId || members.size < 2) return null;
+	const k = contexts.get(ctx), guild = guildFor(k.settings);
+	if (!preview.has(guild) || preview.get(guild).some((ch) => ch.id !== liveChannelId)) return null;
+	const group = [...contexts].filter(([, o]) => o.device === k.device && guildFor(o.settings) === guild)
+		.sort(([, a], [, b]) => a.row - b.row || a.col - b.col);
+	const [, head] = group[0];
+	const row = [group[0][0]];
+	for (const [c, o] of group.slice(1)) {
+		if (row.length >= Math.min(3, members.size)) break;
+		if (o.row === head.row && o.col === head.col + row.length) row.push(c);
+	}
+	const tile = row.indexOf(ctx);
+	return row.length > 1 && tile >= 0 ? { tile, tiles: row.length } : null;
+}
+
+// The people on one tile of a joined row: split in speaking order, up to 3 per key, e.g. 7 on 3 keys -> 3/2/2.
+function tileMembers(tile, tiles) {
+	const list = orderedMembers(), shown = Math.min(list.length, 3 * tiles);
+	const size = (t) => Math.floor(shown / tiles) + (t < shown % tiles ? 1 : 0);
+	let start = 0;
+	for (let t = 0; t < tile; t++) start += size(t);
+	return list.slice(start, start + size(tile));
+}
+
+// RPC has no server-wide voice event (subscriptions are per channel), so the ranking is polled.
+// It isn't needed while you're in a call with only first keys showing.
+const preview = new Map();       // guildId -> rankChannels() result
+const guildFor = (settings) => settings.guildId || globalSettings.lastGuildId || '';
+let previewBusy = null;  // the refresh in progress
+let previewAgain = null; // one follow-up shared by every request made during it
+
+// A request during a refresh runs once more after it, so a key's new server isn't left for the next poll.
 async function refreshPreview() {
-	if (previewBusy || liveChannelId || !isCurrent(ipc) || contexts.size === 0) return;
-	previewBusy = true;
-	try {
-		for (const guild of new Set([...contexts.values()].map(guildFor).filter(Boolean))) {
-			const ranked = await rankChannels(ipc, guild, null).catch(() => null);
-			if (!ranked) continue;
-			const top = ranked[0];
-			preview.set(guild, top && top.count > 0 ? { list: top.states.filter((vs) => vs.user).map((vs) => toMember(vs)), total: top.count } : null);
+	if (previewBusy) return (previewAgain = previewAgain || previewBusy.then(() => { previewAgain = null; return refreshPreview(); }));
+	if (!isCurrent(ipc) || contexts.size === 0) return;
+	if (liveChannelId && ![...contexts.keys()].some((c) => slotOf(c) > 0)) return;
+	previewBusy = (async () => {
+		for (const guild of new Set([...contexts.values()].map((o) => guildFor(o.settings)).filter(Boolean))) {
+			const ranked = await rankChannels(ipc, guild).catch(() => null);
+			if (ranked) preview.set(guild, ranked);
 		}
-	} finally { previewBusy = false; }
+	})().finally(() => { previewBusy = null; });
+	await previewBusy;
 	renderLive();
 }
 
@@ -614,7 +453,8 @@ async function liveSetupChannel(c, channelId) {
 	members.clear(); speakSeq = 0;
 	if (!channelId) quality = -1;
 	renderLive();
-	if (!channelId) { refreshPreview(); return; }
+	refreshPreview(); // the other keys rank the channels you're not in
+	if (!channelId) return;
 	const ch = await c.request('GET_CHANNEL', { channel_id: channelId }).catch(() => null);
 	// Remember the server of your last call: the preview and the key press fall back to it.
 	if (ch && ch.guild_id && ch.guild_id !== globalSettings.lastGuildId) saveGlobalSettings({ ...globalSettings, lastGuildId: ch.guild_id });
@@ -655,11 +495,12 @@ function ensureLive() {
 }
 
 /* ------------------------------------------------------------- Stream Deck */
-// Runs inside launcher.js, which owns the Stream Deck socket and routes our actions here.
-const ACTIONS = new Set(['com.xenside.discordneo.busiest']);
+// plugin.js owns the Stream Deck socket and hands every event to onEvent.
 let host = null; // { send, saveGlobal, font }
 let globalSettings = {};
-const contexts = new Map(); // context -> settings
+const contexts = new Map(); // context -> { settings, device, row, col }
+// Keys inside a multi-action have no position; they rank after the ones on the deck.
+const keyOf = (ev, settings) => { const c = ev.payload && ev.payload.coordinates; return { settings, device: ev.device, row: c ? c.row : 99, col: c ? c.column : 99 }; };
 
 function sdSend(o) { try { host.send(o); } catch (e) { log('sdSend', e.message); } }
 const setTitle = (ctx, title) => sdSend({ event: 'setTitle', context: ctx, payload: { title: String(title), target: 0 } });
@@ -682,8 +523,8 @@ function saveGlobalSettings(gs) {
 let lastError = '';
 async function press(ctx) {
 	try {
-		// Joining needs no confirmation: the key switches to the live view of the new call by itself.
-		const res = await joinBusiest(contexts.get(ctx) || {});
+		// Joining needs no confirmation: the keys switch to the new call by themselves.
+		const res = await joinFor(ctx);
 		lastError = '';
 		if (!res) flashTitle(ctx, 'Empty');
 	} catch (e) {
@@ -723,18 +564,20 @@ function onEvent(ev) {
 			ensureLive();
 			break;
 		case 'willAppear':
-			contexts.set(context, settings);
+			contexts.set(context, keyOf(ev, settings));
 			shownImage.delete(context); // a reappearing key has lost its image
 			renderLive();
 			refreshPreview();
 			break;
 		case 'didReceiveSettings':
-			contexts.set(context, settings);
-			refreshPreview(); // the server may have changed
+			contexts.set(context, keyOf(ev, settings));
+			renderLive(); // the server may have changed, and with it every key's rank
+			refreshPreview();
 			break;
 		case 'willDisappear':
 			contexts.delete(context);
 			shownImage.delete(context);
+			renderLive(); // the keys after it move up a rank
 			break;
 		case 'keyDown':
 			press(context);
@@ -749,8 +592,9 @@ function onEvent(ev) {
 
 function init(h) {
 	host = h;
+	render.init({ log, font: h.font });
 	setInterval(ensureLive, 15000); // reconnect the live view if Discord/IPC drops
 	setInterval(refreshPreview, 20000);
 }
 
-module.exports = { ACTIONS, init, onEvent, log, exeImage };
+module.exports = { init, onEvent, log };
