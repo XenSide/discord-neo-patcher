@@ -23,8 +23,8 @@
 			</select>
 		</div>
 		<div class="sdpi-item">
-			<div class="sdpi-item-label"></div>
-			<button class="sdpi-item-value" id="refresh">Load servers</button>
+			<div class="sdpi-item-label empty"></div>
+			<button class="sdpi-item-value" id="refresh">Reload Servers</button>
 		</div>
 		<div class="sdpi-item">
 			<div class="sdpi-item-label">Status</div>
@@ -35,8 +35,8 @@
 			<summary>Setup</summary>
 			<p class="sdpi-item-value" style="padding:6px 0;">
 				Create an app at discord.com/developers/applications, add the OAuth2 redirect
-				http://localhost, then paste its Client ID and Secret here. The first time you press
-				Load servers (or the key), Discord asks you to authorize the app.
+				http://localhost, then paste its Client ID and Secret here. The first time the server
+				list loads (or you press the key), Discord asks you to authorize the app.
 			</p>
 		</details>
 	</div>
@@ -69,6 +69,8 @@
 			if (p.status != null) $('status').textContent = p.status;
 			if (p.bundled) document.querySelectorAll('.creds').forEach((el) => { el.style.display = 'none'; });
 			if (p.clientId != null) { $('clientId').value = p.clientId; hasSecret = p.hasSecret; $('clientSecret').placeholder = hasSecret ? 'saved' : 'Discord client secret'; }
+			// The status reply comes once per open: fill the server list right away if the app is set up.
+			if (p.bundled != null && (p.bundled || (p.clientId && p.hasSecret))) loadGuilds();
 			if (p.guilds) {
 				const sel = $('guild');
 				sel.length = 1;
@@ -88,6 +90,7 @@
 			const clientId = $('clientId').value.trim(), clientSecret = $('clientSecret').value.trim();
 			if (!clientId || !clientSecret) return; // both are needed; a saved secret is kept until a new one is typed
 			toPlugin({ cmd: 'creds', clientId, clientSecret });
+			loadGuilds();
 			hasSecret = true;
 			$('clientSecret').value = '';
 			$('clientSecret').placeholder = 'saved';
@@ -95,7 +98,8 @@
 
 		$('clientId').addEventListener('change', sendCreds);
 		$('clientSecret').addEventListener('change', sendCreds);
-		$('refresh').addEventListener('click', () => { $('status').textContent = 'Connecting… (check Discord for an Authorize popup)'; toPlugin({ cmd: 'guilds' }); });
+		function loadGuilds() { $('status').textContent = 'Connecting… (check Discord for an Authorize popup)'; toPlugin({ cmd: 'guilds' }); }
+		$('refresh').addEventListener('click', loadGuilds);
 		$('guild').addEventListener('change', () => {
 			const o = $('guild').selectedOptions[0];
 			settings.guildId = o.value;

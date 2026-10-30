@@ -197,8 +197,8 @@ async function joinFor(ctx) {
 	const c = await discord();
 	const current = await c.request('GET_SELECTED_VOICE_CHANNEL').catch(() => null);
 	const inCall = !!(current && current.id), i = slotOf(ctx), guildId = guildFor(contexts.get(ctx).settings);
-	// The first key, and any key sharing your call with it, hangs up (channel_id null leaves voice).
-	if (inCall && (i === 0 || spanOf(ctx))) {
+	// The first key hangs up (channel_id null leaves voice).
+	if (inCall && i === 0) {
 		await c.request('SELECT_VOICE_CHANNEL', { channel_id: null }, 10000);
 		return { left: current };
 	}
@@ -333,19 +333,18 @@ const GLYPH = '<g style="fill:#FFFFFF" transform="translate(30 30) scale(3.5 3.5
 	+ '<circle cx="12" cy="7.2" r="3.1"/><path d="M5.1 19c0-3.72 3.03-6.3 6.9-6.3s6.9 2.58 6.9 6.3v.5H5.1z"/></g>';
 
 // list: members to draw (first is on top); total: count for the pill; joined: false dims the key
-// like the exe does for a channel you're not in (black at 50% over everything); first: false for
-// the 2nd/3rd key of a joined row, which leave the count and connection warning to the first.
-async function buildVoiceKey(list, total, joined, first = true) {
+// like the exe does for a channel you're not in (black at 50% over everything).
+async function buildVoiceKey(list, total, joined) {
 	const shown = list.slice(0, 3);
 	const uris = await Promise.all(shown.map((m) => avatar(m.avatarUrl)));
 	const layers = [['background', () => ART.background]];
 	if (shown.length) {
 		for (let i = shown.length - 1; i >= 0; i--) layers.push(...userLayers(shown[i], uris[i], shown.length, i));
-		if (first) layers.push([`pill ${total}`, () => pillSvg(total, ART.usersTalking)]);
+		layers.push([`pill ${total}`, () => pillSvg(total, ART.usersTalking)]);
 	} else {
 		layers.push(['glyph', () => GLYPH]);
 	}
-	if (joined && first && quality >= 0 && quality <= 1) layers.push([`bars ${quality}`, () => barsSvg(quality)]); // only warn on a bad (red) connection
+	if (joined && quality >= 0 && quality <= 1) layers.push([`bars ${quality}`, () => barsSvg(quality)]); // only warn on a bad (red) connection
 	if (!joined && shown.length) layers.push(['dim', () => '<rect x="0" y="0" width="144" height="144" style="fill:#000000;fill-opacity:.5;stroke:none"/>']);
 	return composite(layers);
 }
@@ -360,10 +359,9 @@ async function renderNow() {
 	const images = new Map(); // one picture per distinct view
 	for (const ctx of contexts.keys()) {
 		const v = viewOf(ctx);
-		const id = v === 'live' ? (members.size ? 'live' : '') : v && v.tile !== undefined ? 'live ' + v.tile + '/' + v.tiles : v ? v.id : '';
+		const id = v === 'live' ? (members.size ? 'live' : '') : v ? v.id : '';
 		if (!images.has(id)) {
 			images.set(id, await (id === 'live' ? buildVoiceKey(orderedMembers(), members.size, true)
-				: v && v.tile !== undefined ? buildVoiceKey(tileMembers(v.tile, v.tiles), members.size, true, v.tile === 0)
 					: id ? buildVoiceKey(v.list, v.total, false) // a channel you're not in, dimmed
 						: buildVoiceKey([], 0, true)));
 		}
@@ -382,43 +380,12 @@ function slotOf(ctx) {
 		.findIndex(([c]) => c === ctx);
 }
 
-// 'live' (your call), { tile, tiles } (part of your call spread over a row), a ranked channel,
-// or null when there is nothing to show at this rank.
+// 'live' (your call), a ranked channel, or null when there is nothing to show at this rank.
 function viewOf(ctx) {
-	const span = spanOf(ctx);
-	if (span) return span;
 	const i = slotOf(ctx), ranked = preview.get(guildFor(contexts.get(ctx).settings)) || [];
 	if (!liveChannelId) return ranked[i] || null;
 	if (i === 0) return 'live';
 	return ranked.filter((ch) => ch.id !== liveChannelId)[i - 1] || null;
-}
-
-// In a call with nobody in the server's other channels, the first key and up to two keys right
-// after it in the same row have nothing else to show, so they share your call: { tile, tiles }.
-// One key per person at most, so no key of the row is left empty.
-function spanOf(ctx) {
-	if (!liveChannelId || members.size < 2) return null;
-	const k = contexts.get(ctx), guild = guildFor(k.settings);
-	if (!preview.has(guild) || preview.get(guild).some((ch) => ch.id !== liveChannelId)) return null;
-	const group = [...contexts].filter(([, o]) => o.device === k.device && guildFor(o.settings) === guild)
-		.sort(([, a], [, b]) => a.row - b.row || a.col - b.col);
-	const [, head] = group[0];
-	const row = [group[0][0]];
-	for (const [c, o] of group.slice(1)) {
-		if (row.length >= Math.min(3, members.size)) break;
-		if (o.row === head.row && o.col === head.col + row.length) row.push(c);
-	}
-	const tile = row.indexOf(ctx);
-	return row.length > 1 && tile >= 0 ? { tile, tiles: row.length } : null;
-}
-
-// The people on one tile of a joined row: split in speaking order, up to 3 per key, e.g. 7 on 3 keys -> 3/2/2.
-function tileMembers(tile, tiles) {
-	const list = orderedMembers(), shown = Math.min(list.length, 3 * tiles);
-	const size = (t) => Math.floor(shown / tiles) + (t < shown % tiles ? 1 : 0);
-	let start = 0;
-	for (let t = 0; t < tile; t++) start += size(t);
-	return list.slice(start, start + size(tile));
 }
 
 // RPC has no server-wide voice event (subscriptions are per channel), so the ranking is polled.
@@ -490,7 +457,7 @@ async function liveStart(c) {
 function ensureLive() {
 	const gs = globalSettings;
 	if (isCurrent(ipc)) return;
-	if (!ownApp() || !gs.accessToken) return; // wait for the user to authorize once via a press / Load servers
+	if (!ownApp() || !gs.accessToken) return; // wait for the user to authorize once via a press or the settings page
 	discord().catch((e) => log('ensureLive', e.message));
 }
 
