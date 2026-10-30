@@ -1,0 +1,5 @@
+dist/
+backup-*/
+node_modules/
+template/bin/app.json
+*.log

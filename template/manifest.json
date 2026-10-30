@@ -1,0 +1,175 @@
+{
+	"Name": "Discord NEO",
+	"Version": "2.4.0.123",
+	"Author": "xenside",
+	"Description": "Elgato's Discord plugin, unmodified, plus a Join Busiest Channel / live speaker key.",
+	"Category": "Discord",
+	"CategoryIcon": "images/category",
+	"Icon": "images/plugin",
+	"URL": "https://github.com/XenSide/discord-neo-patcher",
+	"SDKVersion": 2,
+	"CodePath": "bin/launcher.js",
+	"Nodejs": { "Version": "20" },
+	"Software": { "MinimumVersion": "6.5" },
+	"OS": [{ "Platform": "windows", "MinimumVersion": "10" }],
+	"ApplicationsToMonitor": { "windows": ["Discord.exe", "DiscordCanary.exe", "DiscordPTB.exe"] },
+	"PropertyInspectorPath": "inspectors/index.html",
+	"UUID": "com.xenside.discordneo",
+	"Actions": [
+		{
+			"UUID": "com.elgato.discord.mute",
+			"Name": "Mute",
+			"Tooltip": "Toggle Microphone Mute",
+			"Icon": "images/icons/mute",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/mute_0", "Name": "Mute" }, { "Image": "images/actions/mute_1", "Name": "Unmute" }]
+		},
+		{
+			"UUID": "com.elgato.discord.deafen",
+			"Name": "Deafen",
+			"Tooltip": "Toggle Deafen",
+			"Icon": "images/icons/deafen",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/deafen_0", "Name": "Deafen" }, { "Image": "images/actions/deafen_1", "Name": "Undeafen" }]
+		},
+		{
+			"UUID": "com.elgato.discord.channel.voice",
+			"Name": "Voice Channel",
+			"Tooltip": "Join or leave a voice channel",
+			"Icon": "images/icons/voiceChannel",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/voicechannel_0", "Name": "Enter" }, { "Image": "images/actions/voicechannel_1", "Name": "Leave" }]
+		},
+		{
+			"UUID": "com.elgato.discord.channel.text",
+			"Name": "Text Channel",
+			"Tooltip": "Go to a text channel",
+			"Icon": "images/icons/textChannel",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/textchannel" }]
+		},
+		{
+			"UUID": "com.elgato.discord.pushto.talk",
+			"Name": "Push to Talk",
+			"Tooltip": "Press and hold to talk",
+			"Icon": "images/icons/pushToTalk",
+			"Controllers": ["Keypad"],
+			"SupportedInMultiActions": false,
+			"States": [{ "Image": "images/actions/pushtotalk_0" }, { "Image": "images/actions/pushtotalk_1" }]
+		},
+		{
+			"UUID": "com.elgato.discord.pushto.mute",
+			"Name": "Push to Mute",
+			"Tooltip": "Press and hold to mute",
+			"Icon": "images/icons/pushToMute",
+			"Controllers": ["Keypad"],
+			"SupportedInMultiActions": false,
+			"States": [{ "Image": "images/actions/pushtomute_0" }, { "Image": "images/actions/pushtomute_1" }]
+		},
+		{
+			"UUID": "com.elgato.discord.pushtotalktoggle",
+			"Name": "Voice Input Mode Toggle",
+			"Tooltip": "Toggle between push to talk and voice activity mode",
+			"Icon": "images/icons/voiceInputModeToggle",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/ptttoggle_0", "Name": "Voice Activity" }, { "Image": "images/actions/ptttoggle_1", "Name": "Push to Talk" }]
+		},
+		{
+			"UUID": "com.elgato.discord.setaudiodevice",
+			"Name": "Set Audio Device",
+			"Tooltip": "Select your audio input and output device",
+			"Icon": "images/icons/setAudioDevice",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/headphonesAndMicrophone" }, { "Image": "images/actions/headphonesAndMicrophone_1" }]
+		},
+		{
+			"UUID": "com.elgato.discord.serverstats",
+			"Name": "Server Stats",
+			"Tooltip": "Display user / message stats for a server",
+			"Icon": "images/icons/serverStats",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/serverStats" }]
+		},
+		{
+			"UUID": "com.elgato.discord.soundboard",
+			"Name": "Soundboard",
+			"Tooltip": "Plays a sound on the Discord Soundboard",
+			"Icon": "images/icons/soundboard",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/soundboard" }]
+		},
+		{
+			"UUID": "com.elgato.discord.notifications",
+			"Name": "Notifications",
+			"Tooltip": "Display alerts for recent notifications",
+			"Icon": "images/icons/notifications",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/notifications" }]
+		},
+		{
+			"UUID": "com.elgato.discord.uservolumecontrolbutton",
+			"Name": "User Volume Control",
+			"Tooltip": "Control the volume of users in calls",
+			"Icon": "images/icons/userVolumeControl",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/userVolumeControl" }]
+		},
+		{
+			"UUID": "com.elgato.discord.uservolumecontroldial",
+			"Name": "User Volume Control",
+			"Tooltip": "Control the volume of users in calls",
+			"Icon": "images/icons/userVolumeControl",
+			"Controllers": ["Encoder"],
+			"Encoder": {
+				"layout": "volume_layout.json",
+				"TriggerDescription": { "Rotate": "Adjust Volume", "Push": "Next User", "Touch": "Mute" }
+			},
+			"States": [{ "Image": "images/actions/userVolumeControl" }]
+		},
+		{
+			"UUID": "com.elgato.discord.volumecontrolbutton",
+			"Name": "Volume Control",
+			"Tooltip": "Control the volume of audio devices",
+			"Icon": "images/icons/volumeControl",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/volumeControl" }]
+		},
+		{
+			"UUID": "com.elgato.discord.volumecontrol",
+			"Name": "Volume Control",
+			"Tooltip": "Control the volume of audio devices",
+			"Icon": "images/icons/volumeControl",
+			"Controllers": ["Encoder"],
+			"Encoder": {
+				"layout": "volume_layout.json",
+				"TriggerDescription": { "Rotate": "Adjust Volume", "Push": "Mute/Deafen", "Touch": "Mute/Deafen" }
+			},
+			"States": [{ "Image": "images/actions/volumeControl" }]
+		},
+		{
+			"UUID": "com.elgato.discord.videotoggle",
+			"Name": "Video Toggle",
+			"Tooltip": "Toggles your camera feed in voice calls",
+			"Icon": "images/icons/toggleCamera",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/video_0", "Name": "Enable Video" }, { "Image": "images/actions/video_1", "Name": "Disable Video" }]
+		},
+		{
+			"UUID": "com.elgato.discord.streamtoggle",
+			"Name": "Stream Toggle",
+			"Tooltip": "Toggles your screen sharing in voice calls",
+			"Icon": "images/icons/toggleScreenShare",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "images/actions/stream_0", "Name": "Enable Stream" }, { "Image": "images/actions/stream_1", "Name": "Disable Stream" }]
+		},
+		{
+			"UUID": "com.xenside.discordneo.busiest",
+			"Name": "Join Busiest Channel",
+			"Tooltip": "Join the voice channel with the most people in it. Shows who's in your channel.",
+			"Icon": "neo/icon",
+			"Controllers": ["Keypad"],
+			"PropertyInspectorPath": "neo/busiest.html",
+			"States": [{ "Image": "neo/key" }]
+		}
+	]
+}
