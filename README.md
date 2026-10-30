@@ -5,6 +5,8 @@ Elgato's Discord plugin for Stream Deck, unmodified, plus a **Join Busiest Chann
 - **Press** it to join the voice channel with the most people in your server (falls back to the next one if the busiest is full).
 - **While you're in a call** it shows who's in your channel the same way Elgato's own Voice Channel key does: up to three avatars, the most recent speaker on top with a green ring, mute/deafen badges, a member count, and a warning when your connection is bad.
 
+It also makes Elgato's own **Voice Channel** key cheaper for Stream Deck. During a call that key sends an SVG with every avatar embedded, on each speaking change, and Stream Deck spends 2-3× the CPU rasterizing it that it spends on a PNG. The launcher turns those SVGs into small PNGs, drawing each part of the key once and reusing it.
+
 This repository contains **no Elgato code**. `install.js` builds the plugin from *your own* installed copy of the official Discord plugin: Elgato's files are copied unchanged and run behind a small launcher (`template/bin/launcher.js`) that adds the extra key.
 
 Not affiliated with Elgato or Discord. Windows only.

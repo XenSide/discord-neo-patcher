@@ -361,7 +361,7 @@ function orderedMembers() {
 const num = (n) => String(Math.round(n * 1000) / 1000);
 
 // One user in slot i of an n-avatar layout, as layers bottom to top: round avatar, speaking ring,
-// mute/deafen badges. Each layer is [cache key, () => svg markup, x, y].
+// mute/deafen badges. Each layer is [cache key, () => svg markup, x, y, root <svg> tag (default ours)].
 function userLayers(m, uri, n, i) {
 	// Drawn once per size (and sub-pixel offset), then placed at the slot's whole-pixel position,
 	// so someone moving to another slot as the speaking order changes reuses the same pixels.
@@ -467,17 +467,58 @@ function fontFilesFor(family) {
 	return (fontFiles = files.filter((f) => fs.existsSync(f)));
 }
 
-const svgDoc = (body) => `<svg width="144px" height="144px" viewBox="0 0 144 144" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
+const SVG_OPEN = '<svg width="144px" height="144px" viewBox="0 0 144 144" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">';
+const svgDoc = (body, root = SVG_OPEN) => root + body + '</svg>';
 const layerCache = new Map(); // key -> { x, y, w, h, px }: premultiplied RGBA cropped to the pixels it covers
 
-function layerPixels(key, markup) {
+// Loading fonts costs ~1.5 ms, so only SVGs with text get them.
+function fontOptions(svg) {
+	if (!svg.includes('<text')) return { loadSystemFonts: false };
+	const files = fontFilesFor(fontName());
+	return files.length ? { loadSystemFonts: false, fontFiles: files, defaultFontFamily: fontName() } : { loadSystemFonts: true };
+}
+
+// Top-level elements of an SVG document: { root: '<svg ...>', kids: [...] }, or null if it doesn't close.
+function splitSvg(svg) {
+	const open = /<svg\b[^>]*>/.exec(svg);
+	if (!open) return null;
+	const kids = [], tag = /<(\/?)([A-Za-z][\w:.-]*)[^>]*?(\/?)>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g;
+	let depth = 0, start = 0;
+	tag.lastIndex = open.index + open[0].length;
+	for (let m; (m = tag.exec(svg));) {
+		if (!m[2]) continue; // comment or CDATA
+		if (m[1]) {
+			if (!depth) return m[2] === 'svg' ? { root: open[0], kids } : null;
+			if (!--depth) kids.push(svg.slice(start, tag.lastIndex));
+		} else if (m[3]) {
+			if (!depth) kids.push(m[0]);
+		} else if (!depth++) start = m.index;
+	}
+	return null;
+}
+
+/* The official exe's SVGs (launcher.js), drawn like our own key: each top-level element is a cached
+   layer, so a speaking change only redraws the user group that changed. Definitions go into every
+   layer. Returns a PNG data URI, or null to send the SVG unchanged. */
+function exeImage(svg) {
+	if (!Resvg) return null;
+	const parts = splitSvg(svg);
+	const root = parts ? parts.root : '';
+	// Layers are drawn on our 144x144 canvas, so anything else (or unsplittable) is rendered whole.
+	if (!parts || !/\bwidth=["']144(px)?["']/.test(root) || !/\bheight=["']144(px)?["']/.test(root)
+		|| (/viewBox/.test(root) && !/viewBox=["']0[ ,]+0[ ,]+144[ ,]+144["']/.test(root))) {
+		return 'data:image/png;base64,' + new Resvg(svg, { font: fontOptions(svg) }).render().asPng().toString('base64');
+	}
+	const isDef = (k) => /^<(defs|clipPath|mask|linearGradient|radialGradient|pattern|filter|symbol|style)\b/.test(k);
+	const defs = parts.kids.filter(isDef).join('');
+	return composite(parts.kids.filter((k) => !isDef(k)).map((k) => [defs + k, () => defs + k, 0, 0, parts.root]));
+}
+
+function layerPixels(key, markup, root) {
 	let l = layerCache.get(key);
 	if (l) { layerCache.delete(key); layerCache.set(key, l); return l; } // keep recently used ones last
-	const svg = svgDoc(markup());
-	// Loading fonts costs ~1.5 ms, so only layers with text (the pill) get them.
-	const files = svg.includes('<text') ? fontFilesFor(fontName()) : null;
-	const font = !files ? { loadSystemFonts: false } : files.length ? { loadSystemFonts: false, fontFiles: files, defaultFontFamily: fontName() } : { loadSystemFonts: true };
-	const full = new Resvg(svg, { font }).render().pixels;
+	const svg = svgDoc(markup(), root);
+	const full = new Resvg(svg, { font: fontOptions(svg) }).render().pixels;
 	let x0 = 144, y0 = 144, x1 = -1, y1 = -1;
 	for (let p = 0; p < 144 * 144; p++) {
 		if (!full[p * 4 + 3]) continue;
@@ -496,8 +537,8 @@ function composite(layers) {
 	if (Resvg) {
 		try {
 			const out = Buffer.alloc(144 * 144 * 4);
-			for (const [key, markup, dx = 0, dy = 0] of layers) {
-				const l = layerPixels(key, markup), { w, h, px } = l, x = l.x + dx, y = l.y + dy;
+			for (const [key, markup, dx = 0, dy = 0, root] of layers) {
+				const l = layerPixels(key, markup, root), { w, h, px } = l, x = l.x + dx, y = l.y + dy;
 				// A slot's box can reach past the key's edge; clip so it doesn't wrap into the next row.
 				for (let r = 0; r < Math.min(h, 144 - y); r++) {
 					for (let c = 0, s = r * w * 4, d = ((y + r) * 144 + x) * 4; c < Math.min(w, 144 - x); c++, s += 4, d += 4) {
@@ -515,7 +556,7 @@ function composite(layers) {
 			return 'data:image/png;base64,' + rgbaToPng({ w: 144, h: 144, px: out }).toString('base64');
 		} catch (e) { log('PNG render failed, sending SVG:', e.message); }
 	}
-	return 'data:image/svg+xml;base64,' + Buffer.from(svgDoc(layers.map(([, markup, dx = 0, dy = 0]) => `<g transform="translate(${dx} ${dy})">${markup()}</g>`).join(''))).toString('base64');
+	return 'data:image/svg+xml;base64,' + Buffer.from(svgDoc(layers.map(([, markup, dx = 0, dy = 0]) => `<g transform="translate(${dx} ${dy})">${markup()}</g>`).join(''), layers[0] && layers[0][4])).toString('base64');
 }
 
 let renderTimer = null;
@@ -712,4 +753,4 @@ function init(h) {
 	setInterval(refreshPreview, 20000);
 }
 
-module.exports = { ACTIONS, init, onEvent, log };
+module.exports = { ACTIONS, init, onEvent, log, exeImage };

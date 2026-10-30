@@ -70,10 +70,31 @@ function fromSd(raw) {
 }
 
 /* ------------------------------------------------------------------ exe -> */
+/* The exe sends the in-call Voice Channel key as an SVG with each avatar embedded as a PNG.
+   Stream Deck spends 10-16 ms of CPU on each of those against ~5 ms for a PNG (measured 2026-10-30),
+   on every speaking change, so they go out as PNGs stacked from cached layers (busiest.exeImage).
+   Vector-only SVGs (volume sliders) cost Stream Deck about as much as a PNG and pass through. */
+const pngCache = new Map(); // svg data URI -> png data URI, or null to send it unchanged
+function smallImage(img) {
+	if (typeof img !== 'string' || !img.startsWith('data:image/svg+xml')) return null;
+	if (pngCache.has(img)) return pngCache.get(img);
+	let png = null;
+	try {
+		const comma = img.indexOf(',');
+		const svg = img.slice(0, comma).endsWith(';base64') ? Buffer.from(img.slice(comma + 1), 'base64').toString() : decodeURIComponent(img.slice(comma + 1));
+		if (svg.includes('<image')) png = busiest.exeImage(svg);
+	} catch (e) { log('exe image to PNG failed, sending SVG:', e.message); }
+	pngCache.set(img, png);
+	if (pngCache.size > 32) pngCache.delete(pngCache.keys().next().value); // speaking changes cycle through a few pictures
+	return png;
+}
+
 function fromExe(raw) {
 	let m; try { m = JSON.parse(raw); } catch { sendSd(raw); return; }
 	if (m.event === 'setGlobalSettings') { exeGlobal = m.payload || {}; pushGlobal(); return; }
 	if (m.event === args.registerEvent) return; // we already registered
+	const png = m.event === 'setImage' && smallImage(m.payload && m.payload.image);
+	if (png) { sendSd({ ...m, payload: { ...m.payload, image: png } }); return; }
 	sd && sd.readyState === WebSocket.OPEN ? sd.send(raw) : toSd.push(raw);
 }
 
