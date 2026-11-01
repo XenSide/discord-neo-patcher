@@ -14,7 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const WebSocket = require('ws');
 const render = require('./render');
 
@@ -89,6 +89,22 @@ function forwardImage(raw, m) {
 	});
 }
 
+/* ------------------------------------------------------------ start Discord */
+// One of our keys appearing means a Discord page is on screen: if Discord isn't running, start it
+// straight to the tray (--start-minimized skips the splash and the window, so a game keeps focus).
+const UPDATE_EXE = path.join(process.env.LOCALAPPDATA || '', 'Discord', 'Update.exe');
+let lastDiscordCheck = 0;
+
+function ensureDiscord() {
+	if (Date.now() - lastDiscordCheck < 2000) return; // a page sends willAppear for all its keys at once
+	lastDiscordCheck = Date.now();
+	execFile('tasklist', ['/FI', 'IMAGENAME eq Discord.exe', '/NH'], { windowsHide: true }, (err, out) => {
+		if (err || /Discord\.exe/i.test(out) || !fs.existsSync(UPDATE_EXE)) return;
+		spawn(UPDATE_EXE, ['--processStart', 'Discord.exe', '--process-start-args', '--start-minimized'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+		log('Discord was not running; started it minimized');
+	});
+}
+
 /* ------------------------------------------------------------ relay */
 function fromExe(raw) {
 	let m; try { m = JSON.parse(raw); } catch { sendSd(raw); return; }
@@ -124,7 +140,11 @@ function sdConnect() {
 		while (toSd.length) sd.send(toSd.shift());
 		log('Registered with Stream Deck');
 	});
-	sd.on('message', (d) => sendExe(d.toString()));
+	sd.on('message', (d) => {
+		const s = d.toString();
+		if (s.includes('"willAppear"')) ensureDiscord();
+		sendExe(s);
+	});
 	sd.on('close', () => {
 		log('Stream Deck socket closed; exiting');
 		try { exeProc && exeProc.kill(); } catch {}
